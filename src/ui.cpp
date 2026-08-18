@@ -1,16 +1,46 @@
 #include "ui.h"
 #include <SPI.h>
-
+#include <TJpg_Decoder.h>
+#include <SD.h>
+// --- CONFIGURACIÓN DE LA LUZ DE FONDO ---
+#define TFT_BL 3        // El pin donde conectaste el BL de la pantalla
+#define CANAL_PWM 0      // Canal interno del ESP32 para controlar la luz
 // MANTÉN ESTA LÍNEA EXACTAMENTE COMO LA TENÍAS
 TFT_eSPI tft = TFT_eSPI(); 
 TFT_eSprite spriteTransicion = TFT_eSprite(&tft);
 const char* nombresMenu[] = {"Reproducir cancion", "Modo WiFi", "Bluetooth"};
 const int TOTAL_OPCIONES = 3;
+TFT_eSprite discoVirtual = TFT_eSprite(&tft);
+bool hayPortada = false;
 
 void inicializarPantalla() {
+    // 1. Configuramos el hardware atenuador de luz del ESP32
+    ledcSetup(CANAL_PWM, 5000, 8); // 5000 Hz de frecuencia, 8 bits de resolución (0-255)
+    ledcAttachPin(TFT_BL, CANAL_PWM);
+    
+    // 2. Encendemos la luz al 100% de brillo (255)
+    ledcWrite(CANAL_PWM, 255); 
+
     tft.init();
     tft.setRotation(1); 
     tft.fillScreen(TFT_BLACK);
+}
+void animarFadeOutHW() {
+    // Bajamos la luz de 255 a 0 gradualmente
+    for (int brillo = 255; brillo >= 0; brillo -= 5) {
+        ledcWrite(CANAL_PWM, brillo);
+        delay(2); // Ajusta este delay si quieres que el apagado sea más rápido o lento
+    }
+    ledcWrite(CANAL_PWM, 0); // Aseguramos apagado total
+}
+
+void animarFadeInHW() {
+    // Subimos la luz de 0 a 255 gradualmente
+    for (int brillo = 0; brillo <= 255; brillo += 5) {
+        ledcWrite(CANAL_PWM, brillo);
+        delay(2); // El encendido suele verse mejor un poco más lento
+    }
+    ledcWrite(CANAL_PWM, 255); // Aseguramos brillo máximo
 }
 
 void dibujarMenuPrincipal(int indice, bool desdeAnimacion) {
@@ -136,44 +166,179 @@ void dibujarReproductor(String nombreCancion, int progresoPorcentaje, bool repro
     tft.setTextColor(TFT_CYAN, TFT_NAVY);
     tft.drawString(nombreCancion, tft.width() / 2, 60, 4);
 }
-void dibujarListaCanciones(int indiceSeleccionado, int scrollOffset, const std::vector<String>& lista) {
-    tft.fillScreen(TFT_BLACK);
 
-    // --- CABECERA ---
-    tft.fillRect(0, 0, tft.width(), 30, tft.color565(255, 100, 0)); // Naranja
-    tft.setTextColor(TFT_WHITE, tft.color565(255, 100, 0));
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("LISTA DE REPRODUCCION", tft.width() / 2, 15, 2);
 
-    if (lista.empty()) {
-        tft.setTextColor(TFT_RED, TFT_BLACK);
-        tft.drawString("No hay archivos .mp3", tft.width() / 2, tft.height() / 2, 2);
+void dibujarListaCanciones(int indiceSeleccionado, int scrollOffset, const std::vector<String>& lista, bool redibujarFondo, int indiceSonando) {
+    if (redibujarFondo) {
+        tft.fillScreen(TFT_BLACK);
+        tft.fillRect(0, 0, tft.width(), 30, tft.color565(255, 100, 0)); 
+        tft.setTextColor(TFT_WHITE, tft.color565(255, 100, 0));
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString("LISTA DE REPRODUCCION", tft.width() / 2, 15, 2);
+        
+        if (indiceSonando != -1) {
+            tft.setTextColor(TFT_GREEN, TFT_BLACK);
+            tft.drawString("Audio en 2do plano...", tft.width() / 2, tft.height() - 10, 1);
+        }
+    }
+
+    int yInicio = 35;
+    int altoFila = 30;
+    tft.setTextDatum(ML_DATUM);
+
+    // Iteramos +1 porque el elemento 0 será "Volver al Menú"
+    int totalItems = lista.size() + 1; 
+
+    for (int i = scrollOffset; i < totalItems && i < scrollOffset + 6; i++) {
+        int y = yInicio + ((i - scrollOffset) * altoFila);
+        
+        uint16_t colorFondo = (i == indiceSeleccionado) ? tft.color565(50, 50, 50) : TFT_BLACK;
+        uint16_t colorTexto = (i == indiceSeleccionado) ? tft.color565(255, 100, 0) : TFT_LIGHTGREY;
+        
+        tft.fillRect(0, y, tft.width(), altoFila, colorFondo);
+        tft.setTextColor(colorTexto, colorFondo);
+
+        String texto = "";
+        if (i == 0) {
+            texto = "< Volver al Menu >";
+        } else {
+            texto = lista[i - 1]; // -1 porque el 0 es volver
+            if (texto.length() > 22) texto = texto.substring(0, 20) + "..";
+            // Resaltar en verde la canción que está sonando actualmente
+            if (i - 1 == indiceSonando && i != indiceSeleccionado) {
+                tft.setTextColor(TFT_GREEN, colorFondo);
+            }
+        }
+        
+        tft.drawString((i == indiceSeleccionado ? "> " : "  ") + texto, 10, y + 15, 2);
+    }
+}
+// --- CALLBACK 1: FONDO OSCURECIDO ---
+bool tft_output_bg(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+    for(int i = 0; i < w * h; i++) {
+        uint16_t c = bitmap[i];
+        
+        // Matemática limpia con colores sin invertir
+        uint16_t r = ((c >> 11) & 0x1F) / 3;
+        uint16_t g = ((c >> 5) & 0x3F) / 3;
+        uint16_t b = (c & 0x1F) / 3;
+        bitmap[i] = (r << 11) | (g << 5) | b; 
+    }
+    
+    // Invertimos los bytes solo en la pantalla justo antes de pintar
+    bool oldSwap = tft.getSwapBytes();
+    tft.setSwapBytes(true);
+    tft.pushImage(x, y, w, h, bitmap);
+    tft.setSwapBytes(oldSwap);
+    
+    return 1;
+}
+
+// --- CALLBACK 2: SPRITE RECORTADO 200x200 ---
+bool tft_output_sprite(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+    if (x >= 220 || y >= 220 || x + w <= 20 || y + h <= 20) return 1; 
+
+    for (int row = 0; row < h; row++) {
+        int destY = (y + row) - 20; 
+        if (destY < 0 || destY >= 200) continue;
+
+        for (int col = 0; col < w; col++) {
+            int destX = (x + col) - 20;
+            if (destX < 0 || destX >= 200) continue;
+            
+            // drawPixel usa colores nativos sin invertir, así que ahora funcionará perfecto
+            discoVirtual.drawPixel(destX, destY, bitmap[row * w + col]);
+        }
+    }
+    return 1;
+}
+
+void prepararVistaReproduccion(String nombreMp3) {
+    hayPortada = false;
+    String archivoImg = "/" + nombreMp3;
+    archivoImg.replace(".mp3", ".jpg");
+    archivoImg.replace(".MP3", ".jpg");
+
+    if (!SD.exists(archivoImg)) {
+        tft.fillScreen(TFT_NAVY);
+        tft.drawCircle(tft.width()/2, tft.height()/2, 90, TFT_WHITE);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_WHITE, TFT_NAVY);
+        tft.drawString("Sin Portada", tft.width()/2, tft.height()/2, 2);
         return;
     }
 
-    // --- LISTA DESLIZABLE ---
-    int yInicio = 45;
-    int altoFila = 30;
-    int itemsVisibles = 6; // Cantidad de canciones que caben en la pantalla
+    // 1. DIBUJAR FONDO OSCURO A PANTALLA COMPLETA
+    TJpgDec.setJpgScale(1); 
     
-    tft.setTextDatum(ML_DATUM); // Alinear a la izquierda (Medio)
+    // --- LA MAGIA: Falso para no dañar las matemáticas de color ---
+    TJpgDec.setSwapBytes(false); 
+    
+    TJpgDec.setCallback(tft_output_bg);
+    TJpgDec.drawSdJpg(0, 0, archivoImg.c_str());
 
-    for (int i = scrollOffset; i < lista.size() && i < scrollOffset + itemsVisibles; i++) {
-        int y = yInicio + ((i - scrollOffset) * altoFila);
-        
-        // Si es la canción seleccionada, pintamos el fondo de resalte
-        if (i == indiceSeleccionado) {
-            tft.fillRect(0, y - 15, tft.width(), altoFila, tft.color565(50, 50, 50)); // Gris oscuro
-            tft.setTextColor(tft.color565(255, 100, 0), tft.color565(50, 50, 50)); // Texto Naranja
-        } else {
-            tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-        }
+    // Dibujamos un "plato" negro para que las esquinas rotadas no dejen rastro
+    tft.fillCircle(tft.width()/2, tft.height()/2, 100, TFT_BLACK); 
 
-        // Cortamos el nombre si es muy largo para que no se desborde
-        String nombre = lista[i];
-        if (nombre.length() > 22) nombre = nombre.substring(0, 20) + "..";
-        
-        // Añadimos un cursor ">" a la opción activa
-        tft.drawString((i == indiceSeleccionado ? "> " : "  ") + nombre, 10, y, 2);
+    // 2. CREAR DISCO GRANDE (200x200)
+    if (!discoVirtual.created()) {
+        discoVirtual.createSprite(200, 200);
+        discoVirtual.setSwapBytes(true); // El lienzo debe invertir los colores al enviarlos a la pantalla
     }
+    
+    discoVirtual.fillSprite(TFT_MAGENTA);
+    
+    TJpgDec.setCallback(tft_output_sprite);
+    TJpgDec.drawSdJpg(0, 0, archivoImg.c_str());
+
+    // Hacerlo redondo matemáticamente
+    int r = 100; // Radio
+    for (int x = 0; x < 200; x++) {
+        for (int y = 0; y < 200; y++) {
+            if ((x-100)*(x-100) + (y-100)*(y-100) > r*r) {
+                discoVirtual.drawPixel(x, y, TFT_MAGENTA); 
+            }
+        }
+    }
+    
+    discoVirtual.setPivot(100, 100); 
+    tft.setPivot(tft.width()/2, tft.height()/2);
+    hayPortada = true;
+}
+void dibujarVolumen(int volumen) {
+    tft.fillRect(0, tft.height() - 25, tft.width(), 25, tft.color565(30, 30, 30));
+    tft.setTextColor(TFT_WHITE, tft.color565(30, 30, 30));
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("Volumen: " + String(volumen) + " / 21", tft.width()/2, tft.height() - 12, 2);
+}
+
+void liberarDisco() {
+    if (discoVirtual.created()) {
+        discoVirtual.deleteSprite();
+    }
+}
+void animarDiscoRotando(int angulo) {
+    if (hayPortada) {
+        discoVirtual.pushRotated(angulo, TFT_MAGENTA);
+    }
+}
+// Añade esto al final de ui.cpp
+void animarFadeOut() {
+int centroX = tft.width() / 2;
+    int centroY = tft.height() / 2;
+    int radioMax = 175; // Matemáticamente, 175px de radio cubre las esquinas de una pantalla de 240x240
+
+    int velocidad = 2; // Inicia suave
+    
+    // El círculo oscuro crece desde el centro empujando hacia afuera
+    for (int r = 0; r <= radioMax; r += velocidad) {
+        tft.fillCircle(centroX, centroY, r, TFT_BLACK);
+        
+        velocidad += 2; // Aceleración matemática (curva Ease-In)
+        delay(5);       // Pausa microscópica para la fluidez
+    }
+    
+    // Aseguramos que la pantalla quede limpia
+    tft.fillScreen(TFT_BLACK);
+    delay(20);
 }

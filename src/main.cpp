@@ -2,20 +2,21 @@
 #include "ui.h"
 #include "controles.h"
 #include "almacenamiento.h"
+#include "reproductor.h"
 
-enum EstadoSistema { MENU_PRINCIPAL, LISTA_CANCIONES, MODO_WIFI, MODO_BLUETOOTH };
+enum EstadoSistema { MENU_PRINCIPAL, LISTA_CANCIONES, VISTA_REPRODUCCION, MODO_WIFI, MODO_BLUETOOTH };
 EstadoSistema estadoActual = MENU_PRINCIPAL;
 
-// Variables Menú Carrusel
 int opcionMenu = 0;
 const int TOTAL_OPCIONES = 3;
 int opcionAnterior = -1;
 
-// Variables Lista de Canciones
+int anguloDisco = 0;
+unsigned long ultimoFrame = 0;
+
 int indiceLista = 0;
 int scrollLista = 0;
-const int ITEMS_VISIBLES = 6;
-
+int indiceReproduciendo = -1; 
 bool sdLista = false;
 
 void setup() {
@@ -23,17 +24,18 @@ void setup() {
     inicializarPantalla();
     inicializarEncoder();
     sdLista = inicializarSD();
+    inicializarAudio();
     dibujarMenuPrincipal(opcionMenu);
 }
 
 void loop() {
+    procesarAudio(); 
     leerEncoder();
 
     // ==========================================
-    // ESTADO 1: MENÚ PRINCIPAL (CARRUSEL)
+    // ESTADO 1: MENÚ PRINCIPAL
     // ==========================================
     if (estadoActual == MENU_PRINCIPAL) {
-        
         if (posicionEncoder != 0) {
             opcionMenu += posicionEncoder;
             posicionEncoder = 0;
@@ -53,17 +55,17 @@ void loop() {
         }
 
         if (botonPresionado) {
+            botonPresionado = false; // <-- CONSUMIR CLIC
+
             if (opcionMenu == 0) {
-                // Entrar a la lista de reproducción
                 estadoActual = LISTA_CANCIONES;
                 if (sdLista) {
                     escanearCanciones();
-                    indiceLista = 0; // Reiniciar cursor arriba
-                    scrollLista = 0;
-                    dibujarListaCanciones(indiceLista, scrollLista, listaCanciones);
+                    indiceLista = 0; scrollLista = 0;
+                    dibujarListaCanciones(indiceLista, scrollLista, listaCanciones, true, indiceReproduciendo); 
                 } else {
-                    mostrarMensaje("Sin Tarjeta SD", TFT_RED);
-                    delay(1500); // Mostramos el error 1.5s y volvemos
+                    mostrarMensaje("Sin SD", TFT_RED);
+                    delay(1500);
                     estadoActual = MENU_PRINCIPAL;
                     opcionAnterior = -1; 
                 }
@@ -82,43 +84,99 @@ void loop() {
     // ESTADO 2: LISTA DE CANCIONES
     // ==========================================
     else if (estadoActual == LISTA_CANCIONES) {
-        
-        // Si hay canciones y giramos el encoder...
-        if (posicionEncoder != 0 && !listaCanciones.empty()) {
+        int totalItems = listaCanciones.size() + 1; 
+
+        if (posicionEncoder != 0) {
             indiceLista += posicionEncoder;
             posicionEncoder = 0;
-
-            // Límites para no salirnos de la lista
-            int total = listaCanciones.size();
             if (indiceLista < 0) indiceLista = 0;
-            if (indiceLista >= total) indiceLista = total - 1;
+            if (indiceLista >= totalItems) indiceLista = totalItems - 1;
 
-            // Lógica de Desplazamiento (Scroll)
-            // Si el cursor sube más allá de lo visible, arrastramos el scroll hacia arriba
-            if (indiceLista < scrollLista) {
-                scrollLista = indiceLista;
-            }
-            // Si el cursor baja más allá de lo visible, arrastramos el scroll hacia abajo
-            if (indiceLista >= scrollLista + ITEMS_VISIBLES) {
-                scrollLista = indiceLista - ITEMS_VISIBLES + 1;
-            }
+            if (indiceLista < scrollLista) scrollLista = indiceLista;
+            if (indiceLista >= scrollLista + 6) scrollLista = indiceLista - 6 + 1;
 
-            // Redibujamos la lista actualizada
-            dibujarListaCanciones(indiceLista, scrollLista, listaCanciones);
+            dibujarListaCanciones(indiceLista, scrollLista, listaCanciones, false, indiceReproduciendo); 
         }
 
         if (botonPresionado) {
-            // Próximamente: Aquí conectaremos el Audio I2S para darle "Play".
-            // Por ahora, al presionar regresamos al menú principal.
-            estadoActual = MENU_PRINCIPAL;
-            opcionAnterior = -1; // Forzamos a que el menú se dibuje limpio
+            botonPresionado = false; // <-- CONSUMIR CLIC
+
+            if (indiceLista == 0) {
+                estadoActual = MENU_PRINCIPAL;
+                opcionAnterior = -1; 
+            } else {
+                int indiceReal = indiceLista - 1;
+                
+                // 1. APAGAMOS LA LUZ DE FONDO
+                animarFadeOutHW();
+                
+                // 2. PREPARAMOS GRÁFICOS (En la oscuridad)
+                prepararVistaReproduccion(listaCanciones[indiceReal]);
+                
+                if (indiceReal != indiceReproduciendo) {
+                    indiceReproduciendo = indiceReal;
+                    reproducirCancion(listaCanciones[indiceReproduciendo]);
+                }
+                
+                estadoActual = VISTA_REPRODUCCION;
+                dibujarVolumen(volumenActual);
+                // ---> AÑADE ESTA LÍNEA AQUÍ <---
+                // Estampamos el disco en la oscuridad antes de encender la luz
+                animarDiscoRotando(anguloDisco);
+                // 3. ENCENDEMOS LA LUZ DE FONDO (Transición perfecta)
+                animarFadeInHW();
+            }
         }
     }
     // ==========================================
-    // OTROS ESTADOS (VOLVER AL MENÚ)
+    // ESTADO 3: REPRODUCTOR 
     // ==========================================
+    else if (estadoActual == VISTA_REPRODUCCION) {
+        
+        if (posicionEncoder != 0) {
+            cambiarVolumen(posicionEncoder);
+            posicionEncoder = 0;
+            dibujarVolumen(volumenActual);
+        }
+
+        if (millis() - ultimoFrame > 40) {
+            anguloDisco = (anguloDisco + 2) % 360;
+            animarDiscoRotando(anguloDisco);
+            ultimoFrame = millis();
+        }
+
+        if (cancionTerminada) {
+            indiceReproduciendo++; 
+            if (indiceReproduciendo >= listaCanciones.size()) indiceReproduciendo = 0; 
+            
+            // Aquí también podemos aplicar el Fade por hardware al cambiar de pista automáticamente
+            animarFadeOutHW();
+            prepararVistaReproduccion(listaCanciones[indiceReproduciendo]);
+            reproducirCancion(listaCanciones[indiceReproduciendo]);
+            dibujarVolumen(volumenActual);
+            animarDiscoRotando(anguloDisco);
+            animarFadeInHW();
+        }
+
+        if (botonPresionado) {
+            botonPresionado = false; // <-- CONSUMIR CLIC
+            
+            // 1. APAGAMOS LA LUZ
+            animarFadeOutHW();
+            
+            estadoActual = LISTA_CANCIONES;
+            liberarDisco(); 
+            
+            // 2. DIBUJAMOS LA LISTA (En la oscuridad)
+            dibujarListaCanciones(indiceLista, scrollLista, listaCanciones, true, indiceReproduciendo);
+            
+            // 3. ENCENDEMOS LA LUZ
+            animarFadeInHW();
+        }
+    }
     else {
         if (botonPresionado) {
+            botonPresionado = false; // <-- CONSUMIR CLIC
             estadoActual = MENU_PRINCIPAL;
             opcionAnterior = -1;
         }
