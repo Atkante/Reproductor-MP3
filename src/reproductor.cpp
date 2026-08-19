@@ -39,3 +39,6 @@ void cambiarVolumen(int delta) {
 void audio_eof_mp3(const char *info) {
     cancionTerminada = true;
 }
+void pausarReanudarCancion() {
+    audio.pauseResume(); // Esta función nativa intercala entre pausa y play
+}

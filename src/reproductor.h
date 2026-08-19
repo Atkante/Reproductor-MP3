@@ -8,6 +8,7 @@ void reproducirCancion(String nombreMp3);
 void detenerAudio();
 void procesarAudio();
 void cambiarVolumen(int delta);
+void pausarReanudarCancion();
 
 extern bool cancionTerminada;
 extern int volumenActual;
